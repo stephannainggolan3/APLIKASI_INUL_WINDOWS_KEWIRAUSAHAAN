@@ -39,8 +39,8 @@ CREATE TABLE IF NOT EXISTS pelanggan (
     no_hp            TEXT NOT NULL UNIQUE,
     instansi         TEXT,
     alamat           TEXT,
-    dibuat_pada      TEXT NOT NULL DEFAULT (datetime('now', 'localtime')),
-    diperbarui_pada  TEXT NOT NULL DEFAULT (datetime('now', 'localtime'))
+    dibuat_pada      TEXT NOT NULL DEFAULT (datetime('now', '+7 hours')),
+    diperbarui_pada  TEXT NOT NULL DEFAULT (datetime('now', '+7 hours'))
 );
 
 -- ---------------------------------------------------------------------
@@ -58,8 +58,8 @@ CREATE TABLE IF NOT EXISTS akun (
     google_sub      TEXT    UNIQUE,
     foto_url        TEXT,
     pelanggan_id    INTEGER UNIQUE REFERENCES pelanggan(id) ON DELETE SET NULL,
-    dibuat_pada     TEXT    NOT NULL DEFAULT (datetime('now', 'localtime')),
-    login_terakhir  TEXT    NOT NULL DEFAULT (datetime('now', 'localtime')),
+    dibuat_pada     TEXT    NOT NULL DEFAULT (datetime('now', '+7 hours')),
+    login_terakhir  TEXT    NOT NULL DEFAULT (datetime('now', '+7 hours')),
     CHECK (password_hash IS NOT NULL OR google_sub IS NOT NULL)
 );
 
@@ -70,7 +70,7 @@ CREATE TABLE IF NOT EXISTS akun (
 CREATE TABLE IF NOT EXISTS sesi (
     token_hash   TEXT    PRIMARY KEY,
     akun_id      INTEGER NOT NULL REFERENCES akun(id) ON DELETE CASCADE,
-    dibuat_pada  TEXT    NOT NULL DEFAULT (datetime('now', 'localtime')),
+    dibuat_pada  TEXT    NOT NULL DEFAULT (datetime('now', '+7 hours')),
     kedaluwarsa  TEXT    NOT NULL
 );
 CREATE INDEX IF NOT EXISTS ix_sesi_akun ON sesi (akun_id);
@@ -94,8 +94,8 @@ CREATE TABLE IF NOT EXISTS pesanan (
     status           TEXT    NOT NULL DEFAULT 'menunggu'
                      CHECK (status IN ('menunggu', 'dikonfirmasi', 'diproses', 'selesai', 'dibatalkan')),
     catatan_admin    TEXT,
-    dibuat_pada      TEXT    NOT NULL DEFAULT (datetime('now', 'localtime')),
-    diperbarui_pada  TEXT    NOT NULL DEFAULT (datetime('now', 'localtime'))
+    dibuat_pada      TEXT    NOT NULL DEFAULT (datetime('now', '+7 hours')),
+    diperbarui_pada  TEXT    NOT NULL DEFAULT (datetime('now', '+7 hours'))
 );
 
 -- ---------------------------------------------------------------------

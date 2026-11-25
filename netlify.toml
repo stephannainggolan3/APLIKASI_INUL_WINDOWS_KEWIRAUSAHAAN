@@ -1,0 +1,27 @@
+# Pengaturan deploy BoysClub IT di Netlify
+# - Tampilan (folder public/) disajikan sebagai situs statis
+# - Semua request /api/* dijalankan oleh Netlify Function (server.js)
+# - Database: Turso (isi TURSO_DATABASE_URL & TURSO_AUTH_TOKEN di Environment variables)
+
+[build]
+  publish = "public"
+  command = "echo Tidak ada proses build"
+
+[build.environment]
+  NODE_VERSION = "22"
+
+[functions]
+  directory = "netlify/functions"
+  node_bundler = "esbuild"
+  included_files = ["database/*.sql"]
+
+[[redirects]]
+  from = "/api/*"
+  to = "/.netlify/functions/api/:splat"
+  status = 200
+  force = true
+
+[[redirects]]
+  from = "/admin"
+  to = "/#admin"
+  status = 302

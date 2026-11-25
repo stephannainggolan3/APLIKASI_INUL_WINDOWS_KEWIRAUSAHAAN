@@ -71,6 +71,45 @@ Cara mendapatkan Client ID (gratis):
    Isi **Authorized JavaScript origins** dengan `http://localhost:3000` dan `http://localhost`.
 4. Salin Client ID ke `GOOGLE_CLIENT_ID` di `.env`, lalu jalankan ulang server.
 
+## Deploy Online (Netlify + Turso, gratis)
+
+Aplikasi bisa berjalan di dua tempat dengan kode yang sama:
+
+| | Tampilan & server | Database |
+|---|---|---|
+| **Laptop** (`npm start` / `Jalankan Aplikasi.bat`) | Express di `server.js` | File `data/boysclub.db` |
+| **Online** | Netlify (folder `public/` + Netlify Function `netlify/functions/api.js`) | **Turso** (SQLite online) |
+
+Database online dipilih otomatis jika `TURSO_DATABASE_URL` diisi. Struktur tabelnya tetap dari `database/schema.sql`
+dan dibuat otomatis saat aplikasi pertama kali diakses.
+
+### 1. Buat database di Turso
+1. Buka https://app.turso.tech, lalu **Continue with GitHub**.
+2. Buat database baru (misalnya `boysclub`) dan pilih lokasi terdekat (misalnya Singapore/Asia).
+3. Salin **Database URL** (bentuknya `libsql://boysclub-xxxx.turso.io`).
+4. Klik **Create Token**, lalu salin tokennya.
+
+### 2. Hubungkan GitHub ke Netlify
+1. Buka https://app.netlify.com, lalu **Continue with GitHub**.
+2. Pilih **Add new project → Import an existing project → GitHub**, lalu pilih repository aplikasi ini.
+3. Pengaturan build otomatis terbaca dari `netlify.toml`, jadi tidak perlu diubah.
+4. Sebelum deploy, isi **Environment variables**:
+
+   | Key | Value |
+   |---|---|
+   | `TURSO_DATABASE_URL` | URL dari Turso |
+   | `TURSO_AUTH_TOKEN` | Token dari Turso |
+   | `ADMIN_EMAILS` | Email admin (pisahkan dengan koma) |
+   | `ADMIN_KODE` | Kode admin rahasia (buat baru, jangan sama dengan yang di laptop) |
+
+5. Klik **Deploy**. Situs tersedia di `https://nama-situs.netlify.app`.
+
+Setiap `git push` ke GitHub akan otomatis di-deploy ulang oleh Netlify.
+Kalau muncul pesan "Database belum diatur", berarti `TURSO_DATABASE_URL`/`TURSO_AUTH_TOKEN` belum diisi.
+Setelah mengisinya, buka **Deploys → Trigger deploy**.
+
+Catatan: semua waktu memakai WIB. Pembatas percobaan password di Netlify berlaku per instance server, jadi sedikit lebih longgar dibanding di laptop.
+
 ## Alur Aplikasi (sesuai wireframe)
 
 | No | Layar | File / fungsi |
@@ -96,7 +135,9 @@ Screenshot setiap layar ada di folder [`dokumentasi/tampilan/`](dokumentasi/tamp
 ├── .env                 # Konfigurasi: ADMIN_EMAILS, ADMIN_KODE, GOOGLE_CLIENT_ID (jangan dibagikan)
 ├── .env.example         # Contoh isi .env
 ├── server.js            # Server Express + REST API + login (password & Google)
-├── db.js                # Koneksi SQLite & inisialisasi
+├── netlify.toml         # Pengaturan deploy Netlify
+├── netlify/functions/api.js  # Menjalankan server.js sebagai Netlify Function
+├── db.js                # Koneksi database: file lokal (node:sqlite) atau Turso (online)
 ├── database/
 │   ├── schema.sql       # Struktur tabel, index, view
 │   └── seed.sql         # Data awal layanan & paket

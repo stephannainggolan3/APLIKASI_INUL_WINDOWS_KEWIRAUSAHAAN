@@ -1,10 +1,12 @@
 // BoysClub IT - Server API pemesanan jasa IT
+// Berjalan di laptop (`npm start`) maupun di Netlify Functions (netlify/functions/api.js).
+process.env.TZ = 'Asia/Jakarta'; // jadwal & kode pesanan selalu memakai WIB, di server mana pun
+
 const express = require('express');
 const path = require('path');
 const crypto = require('crypto');
 const { promisify } = require('util');
-const { OAuth2Client } = require('google-auth-library');
-const { db, transaction } = require('./db');
+const { db, init } = require('./db');
 
 // ------------------------------------------------------- konfigurasi (.env)
 const PORT = Number(process.env.PORT) || 3000;
@@ -20,11 +22,32 @@ const scrypt = promisify(crypto.scrypt);
 const JAM_LAYANAN = ['08:00', '09:00', '10:00', '11:00', '13:00', '14:00', '15:00', '16:00'];
 const STATUS = ['menunggu', 'dikonfirmasi', 'diproses', 'selesai', 'dibatalkan'];
 
-const googleClient = new OAuth2Client();
+// Waktu sekarang (WIB) di SQL - server database (Turso) memakai UTC
+const SEKARANG = "datetime('now','+7 hours')";
+
+let googleClient = null; // dimuat hanya jika login Google dipakai
+function klienGoogle() {
+  if (!googleClient) {
+    const { OAuth2Client } = require('google-auth-library');
+    googleClient = new OAuth2Client();
+  }
+  return googleClient;
+}
+
 const app = express();
-// Di hosting (Railway/Render) aplikasi berada di belakang proxy HTTPS:
+// Di hosting (Netlify/Railway/Render) aplikasi berada di belakang proxy HTTPS:
 // agar cookie login bertanda Secure dan IP pengunjung terbaca dengan benar.
-if (process.env.TRUST_PROXY || process.env.RAILWAY_ENVIRONMENT || process.env.RENDER) app.set('trust proxy', 1);
+if (process.env.TRUST_PROXY || process.env.NETLIFY || process.env.AWS_LAMBDA_FUNCTION_NAME
+  || process.env.RAILWAY_ENVIRONMENT || process.env.RENDER) {
+  app.set('trust proxy', 1);
+}
+
+// Netlify meneruskan /api/* ke /.netlify/functions/api/* -> kembalikan ke /api/*
+app.use((req, res, next) => {
+  const awalan = '/.netlify/functions/api';
+  if (req.url.startsWith(awalan)) req.url = '/api' + (req.url.slice(awalan.length) || '/');
+  next();
+});
 app.use(express.json({ limit: '20kb' }));
 app.use(express.static(path.join(__dirname, 'public')));
 
@@ -62,6 +85,19 @@ class HttpError extends Error {
 }
 const gagal = (res, code, pesan) => res.status(code).json({ error: pesan });
 
+function tanganiError(res, err) {
+  if (res.headersSent) return;
+  if (err instanceof HttpError || err.status === 503) return gagal(res, err.status, err.message);
+  if (String(err.message).includes('jadwal_tanggal')) {
+    return gagal(res, 409, 'Maaf, jadwal tersebut baru saja dipesan orang lain. Silakan pilih jam lain.');
+  }
+  console.error(err);
+  gagal(res, 500, 'Terjadi kesalahan pada server.');
+}
+
+// Pembungkus handler async: error otomatis diteruskan ke tanganiError
+const h = (fn) => (req, res, next) => Promise.resolve(fn(req, res, next)).catch((err) => tanganiError(res, err));
+
 // ------------------------------------------------------------- sesi login
 const hashToken = (t) => crypto.createHash('sha256').update(t).digest('hex');
 
@@ -85,14 +121,14 @@ function samaPersis(a, b) {
   return x.length === y.length && crypto.timingSafeEqual(x, y);
 }
 
-// Membuat sesi login baru + cookie (dipanggil di dalam transaksi)
-function buatSesi(req, res, akunId) {
+// Membuat sesi login baru (dipanggil di dalam transaksi). Cookie dipasang setelah COMMIT.
+async function buatSesi(t, akunId) {
   const token = crypto.randomBytes(32).toString('base64url');
-  db.prepare("DELETE FROM sesi WHERE kedaluwarsa <= datetime('now','localtime')").run();
-  db.prepare(`INSERT INTO sesi (token_hash, akun_id, kedaluwarsa)
-              VALUES (?, ?, datetime('now','localtime','+${SESI_HARI} days'))`).run(hashToken(token), akunId);
-  db.prepare("UPDATE akun SET login_terakhir = datetime('now','localtime') WHERE id = ?").run(akunId);
-  setCookieSesi(req, res, token, SESI_HARI * 86400);
+  await t.run(`DELETE FROM sesi WHERE kedaluwarsa <= ${SEKARANG}`);
+  await t.run(`INSERT INTO sesi (token_hash, akun_id, kedaluwarsa)
+               VALUES (?, ?, datetime('now','+7 hours','+${SESI_HARI} days'))`, hashToken(token), akunId);
+  await t.run(`UPDATE akun SET login_terakhir = ${SEKARANG} WHERE id = ?`, akunId);
+  return token;
 }
 
 // Password di-hash dengan scrypt + salt acak (password asli tidak pernah disimpan)
@@ -126,18 +162,18 @@ function catatGagal(kunci) {
 
 const EMAIL_RE = /^[^\s@]{1,64}@[^\s@]+\.[^\s@]{2,}$/;
 
-// Setiap request API: cek cookie sesi -> req.akun
-app.use('/api', (req, res, next) => {
+// Setiap request API: siapkan database, lalu cek cookie sesi -> req.akun
+app.use('/api', h(async (req, res, next) => {
+  await init();
   const token = bacaCookie(req, 'bc_sesi');
   if (token) {
-    const akun = db.prepare(
+    const akun = await db.get(
       `SELECT a.* FROM sesi s JOIN akun a ON a.id = s.akun_id
-        WHERE s.token_hash = ? AND s.kedaluwarsa > datetime('now','localtime')`
-    ).get(hashToken(token));
+        WHERE s.token_hash = ? AND s.kedaluwarsa > ${SEKARANG}`, hashToken(token));
     if (akun) { req.akun = akun; req.isAdmin = isAdminEmail(akun.email); }
   }
   next();
-});
+}));
 
 const perluMasuk = (req, res, next) => (req.akun ? next() : gagal(res, 401, 'Silakan masuk terlebih dahulu.'));
 const perluAdmin = (req, res, next) => {
@@ -146,10 +182,10 @@ const perluAdmin = (req, res, next) => {
   next();
 };
 
-function dataAkun(req) {
+async function dataAkun(req) {
   const a = req.akun;
   const profil = a.pelanggan_id
-    ? db.prepare('SELECT nama_lengkap, no_hp, instansi, alamat FROM pelanggan WHERE id = ?').get(a.pelanggan_id)
+    ? await db.get('SELECT nama_lengkap, no_hp, instansi, alamat FROM pelanggan WHERE id = ?', a.pelanggan_id)
     : null;
   return { email: a.email, nama: a.nama, foto: a.foto_url, admin: !!req.isAdmin, profil: profil || null };
 }
@@ -169,52 +205,57 @@ function validasiProfil(b, { alamatWajib }) {
 }
 
 // Menyimpan data pelanggan milik akun (dipanggil di dalam transaksi).
-// Jika nomor HP sudah ada sebagai pelanggan tamu (pesanan lama sebelum ada
-// fitur akun), datanya digabungkan ke akun ini agar riwayatnya ikut muncul.
-function simpanPelangganAkun(akun, d) {
-  const pemilikHp = db.prepare(
-    'SELECT p.id, a.id AS akun_id FROM pelanggan p LEFT JOIN akun a ON a.pelanggan_id = p.id WHERE p.no_hp = ?'
-  ).get(d.hp);
+// Jika nomor HP sudah ada sebagai pelanggan tamu, datanya digabungkan ke akun ini
+// agar riwayat pesanannya ikut muncul.
+async function simpanPelangganAkun(t, akun, d) {
+  const pemilikHp = await t.get(
+    'SELECT p.id, a.id AS akun_id FROM pelanggan p LEFT JOIN akun a ON a.pelanggan_id = p.id WHERE p.no_hp = ?', d.hp);
   if (pemilikHp?.akun_id && pemilikHp.akun_id !== akun.id) {
     throw new HttpError(409, 'Nomor HP ini sudah terdaftar di akun lain.');
   }
 
   let pid = akun.pelanggan_id;
   if (pid && pemilikHp && pemilikHp.id !== pid) {
-    db.prepare('UPDATE pesanan SET pelanggan_id = ? WHERE pelanggan_id = ?').run(pid, pemilikHp.id);
-    db.prepare('DELETE FROM pelanggan WHERE id = ?').run(pemilikHp.id);
+    await t.run('UPDATE pesanan SET pelanggan_id = ? WHERE pelanggan_id = ?', pid, pemilikHp.id);
+    await t.run('DELETE FROM pelanggan WHERE id = ?', pemilikHp.id);
   } else if (!pid && pemilikHp) {
     pid = pemilikHp.id;
   }
 
   if (pid) {
-    db.prepare(
+    await t.run(
       `UPDATE pelanggan SET nama_lengkap = ?, no_hp = ?, instansi = ?, alamat = COALESCE(NULLIF(?, ''), alamat),
-              diperbarui_pada = datetime('now','localtime') WHERE id = ?`
-    ).run(d.nama, d.hp, d.instansi, d.alamat, pid);
+              diperbarui_pada = ${SEKARANG} WHERE id = ?`, d.nama, d.hp, d.instansi, d.alamat, pid);
   } else {
-    pid = Number(db.prepare('INSERT INTO pelanggan (nama_lengkap, no_hp, instansi, alamat) VALUES (?, ?, ?, ?)')
-      .run(d.nama, d.hp, d.instansi, d.alamat || null).lastInsertRowid);
+    pid = (await t.run('INSERT INTO pelanggan (nama_lengkap, no_hp, instansi, alamat) VALUES (?, ?, ?, ?)',
+      d.nama, d.hp, d.instansi, d.alamat || null)).lastInsertRowid;
   }
-  db.prepare('UPDATE akun SET pelanggan_id = ? WHERE id = ?').run(pid, akun.id);
+  await t.run('UPDATE akun SET pelanggan_id = ? WHERE id = ?', pid, akun.id);
   akun.pelanggan_id = pid;
   return pid;
 }
 
-function tanganiError(res, err) {
-  if (err instanceof HttpError) return gagal(res, err.status, err.message);
-  if (String(err.message).includes('jadwal_tanggal')) {
-    return gagal(res, 409, 'Maaf, jadwal tersebut baru saja dipesan orang lain. Silakan pilih jam lain.');
+// Pemesan tanpa akun (tamu): cari pelanggan berdasarkan No. HP atau buat baru.
+// Data profil milik akun terdaftar tidak ditimpa oleh pesanan tamu.
+async function simpanPelangganTamu(t, d) {
+  const ada = await t.get(
+    'SELECT p.id, a.id AS akun_id FROM pelanggan p LEFT JOIN akun a ON a.pelanggan_id = p.id WHERE p.no_hp = ?', d.hp);
+  if (ada) {
+    if (!ada.akun_id) {
+      await t.run(`UPDATE pelanggan SET nama_lengkap = ?, instansi = ?, alamat = ?, diperbarui_pada = ${SEKARANG}
+                    WHERE id = ?`, d.nama, d.instansi, d.alamat, ada.id);
+    }
+    return ada.id;
   }
-  console.error(err);
-  gagal(res, 500, 'Terjadi kesalahan pada server.');
+  return (await t.run('INSERT INTO pelanggan (nama_lengkap, no_hp, instansi, alamat) VALUES (?, ?, ?, ?)',
+    d.nama, d.hp, d.instansi, d.alamat)).lastInsertRowid;
 }
 
 // ------------------------------------------------------- API autentikasi
 app.get('/api/config', (req, res) => res.json({ googleClientId: GOOGLE_CLIENT_ID || null }));
 
 // Daftar akun baru dengan email + password
-app.post('/api/auth/daftar', async (req, res) => {
+app.post('/api/auth/daftar', h(async (req, res) => {
   const b = req.body || {};
   const nama = teks(b.nama, 100);
   const email = teks(b.email, 254).toLowerCase();
@@ -224,7 +265,7 @@ app.post('/api/auth/daftar', async (req, res) => {
   if (password.length < 8) return gagal(res, 400, 'Password minimal 8 karakter.');
   if (password.length > 200) return gagal(res, 400, 'Password terlalu panjang.');
 
-  const ada = db.prepare('SELECT password_hash FROM akun WHERE email = ?').get(email);
+  const ada = await db.get('SELECT password_hash FROM akun WHERE email = ?', email);
   if (ada) {
     return gagal(res, 409, ada.password_hash
       ? 'Email ini sudah terdaftar. Silakan masuk.'
@@ -233,7 +274,7 @@ app.post('/api/auth/daftar', async (req, res) => {
 
   // Email admin: wajib kode admin agar orang lain tidak bisa mendaftar memakai email admin
   if (isAdminEmail(email)) {
-    if (!ADMIN_KODE) return gagal(res, 403, 'Pendaftaran admin belum diatur: isi ADMIN_KODE di file .env.');
+    if (!ADMIN_KODE) return gagal(res, 403, 'Pendaftaran admin belum diatur: isi ADMIN_KODE di pengaturan server.');
     const kunci = `kode|${req.ip}`;
     if (terblokir(kunci)) return gagal(res, 429, 'Terlalu banyak percobaan kode admin. Coba lagi dalam 15 menit.');
     if (!samaPersis(teks(b.kode_admin, 100), ADMIN_KODE)) {
@@ -242,25 +283,25 @@ app.post('/api/auth/daftar', async (req, res) => {
     }
   }
 
+  const hash = await hashPassword(password);
+  let hasil;
   try {
-    const hash = await hashPassword(password);
-    const id = transaction(() => {
-      const id = Number(db.prepare('INSERT INTO akun (email, nama, password_hash) VALUES (?, ?, ?)')
-        .run(email, nama, hash).lastInsertRowid);
-      buatSesi(req, res, id);
-      return id;
+    hasil = await db.transaction(async (t) => {
+      const id = (await t.run('INSERT INTO akun (email, nama, password_hash) VALUES (?, ?, ?)', email, nama, hash)).lastInsertRowid;
+      return { id, token: await buatSesi(t, id) };
     });
-    req.akun = db.prepare('SELECT * FROM akun WHERE id = ?').get(id);
-    req.isAdmin = isAdminEmail(email);
-    res.status(201).json({ ...dataAkun(req), baru: true });
   } catch (err) {
     if (String(err.message).includes('akun.email')) return gagal(res, 409, 'Email ini sudah terdaftar. Silakan masuk.');
-    tanganiError(res, err);
+    throw err;
   }
-});
+  setCookieSesi(req, res, hasil.token, SESI_HARI * 86400);
+  req.akun = await db.get('SELECT * FROM akun WHERE id = ?', hasil.id);
+  req.isAdmin = isAdminEmail(email);
+  res.status(201).json({ ...(await dataAkun(req)), baru: true });
+}));
 
 // Masuk dengan email + password
-app.post('/api/auth/masuk', async (req, res) => {
+app.post('/api/auth/masuk', h(async (req, res) => {
   const b = req.body || {};
   const email = teks(b.email, 254).toLowerCase();
   const password = typeof b.password === 'string' ? b.password.slice(0, 200) : '';
@@ -269,7 +310,7 @@ app.post('/api/auth/masuk', async (req, res) => {
   const kunci = `${req.ip}|${email}`;
   if (terblokir(kunci)) return gagal(res, 429, 'Terlalu banyak percobaan gagal. Coba lagi dalam 15 menit.');
 
-  const akun = db.prepare('SELECT * FROM akun WHERE email = ?').get(email);
+  const akun = await db.get('SELECT * FROM akun WHERE email = ?', email);
   if (akun && !akun.password_hash) {
     return gagal(res, 400, 'Akun ini terdaftar dengan Google. Silakan masuk dengan Google.');
   }
@@ -278,24 +319,23 @@ app.post('/api/auth/masuk', async (req, res) => {
     return gagal(res, 401, 'Email atau password salah.');
   }
   percobaanGagal.delete(kunci);
-  try {
-    transaction(() => buatSesi(req, res, akun.id));
-    req.akun = akun;
-    req.isAdmin = isAdminEmail(akun.email);
-    res.json({ ...dataAkun(req), baru: false });
-  } catch (err) { tanganiError(res, err); }
-});
+  const token = await db.transaction((t) => buatSesi(t, akun.id));
+  setCookieSesi(req, res, token, SESI_HARI * 86400);
+  req.akun = akun;
+  req.isAdmin = isAdminEmail(akun.email);
+  res.json({ ...(await dataAkun(req)), baru: false });
+}));
 
 // Masuk / daftar dengan Google (opsional, aktif jika GOOGLE_CLIENT_ID diisi).
 // Jika email Google sama dengan akun email + password yang sudah ada, keduanya digabung.
-app.post('/api/auth/google', async (req, res) => {
+app.post('/api/auth/google', h(async (req, res) => {
   if (!GOOGLE_CLIENT_ID) return gagal(res, 503, 'Login Google belum diatur di server (GOOGLE_CLIENT_ID kosong).');
   const credential = req.body?.credential;
   if (typeof credential !== 'string' || credential.length > 4096) return gagal(res, 400, 'Data login tidak valid.');
 
   let p;
   try {
-    const ticket = await googleClient.verifyIdToken({ idToken: credential, audience: GOOGLE_CLIENT_ID });
+    const ticket = await klienGoogle().verifyIdToken({ idToken: credential, audience: GOOGLE_CLIENT_ID });
     p = ticket.getPayload();
   } catch {
     return gagal(res, 401, 'Verifikasi akun Google gagal. Silakan coba lagi.');
@@ -306,205 +346,179 @@ app.post('/api/auth/google', async (req, res) => {
   const nama = teks(p.name, 100) || email.split('@')[0];
   const foto = typeof p.picture === 'string' ? p.picture.slice(0, 500) : null;
 
-  try {
-    const { id, baru } = transaction(() => {
-      const bySub = db.prepare('SELECT id FROM akun WHERE google_sub = ?').get(p.sub);
-      if (bySub) {
-        db.prepare('UPDATE akun SET foto_url = ? WHERE id = ?').run(foto, bySub.id);
-        buatSesi(req, res, bySub.id);
-        return { id: bySub.id, baru: false };
-      }
-      const byEmail = db.prepare('SELECT id, google_sub FROM akun WHERE email = ?').get(email);
-      if (byEmail) {
-        if (byEmail.google_sub) throw new HttpError(409, 'Email ini sudah terhubung dengan akun Google lain.');
-        // Google sudah memverifikasi pemilik email -> hubungkan ke akun email + password yang ada
-        db.prepare('UPDATE akun SET google_sub = ?, foto_url = ? WHERE id = ?').run(p.sub, foto, byEmail.id);
-        buatSesi(req, res, byEmail.id);
-        return { id: byEmail.id, baru: false };
-      }
-      const id = Number(db.prepare('INSERT INTO akun (google_sub, email, nama, foto_url) VALUES (?, ?, ?, ?)')
-        .run(p.sub, email, nama, foto).lastInsertRowid);
-      buatSesi(req, res, id);
-      return { id, baru: true };
-    });
-    req.akun = db.prepare('SELECT * FROM akun WHERE id = ?').get(id);
-    req.isAdmin = isAdminEmail(email);
-    res.json({ ...dataAkun(req), baru });
-  } catch (err) { tanganiError(res, err); }
-});
+  const { id, baru, token } = await db.transaction(async (t) => {
+    const bySub = await t.get('SELECT id FROM akun WHERE google_sub = ?', p.sub);
+    if (bySub) {
+      await t.run('UPDATE akun SET foto_url = ? WHERE id = ?', foto, bySub.id);
+      return { id: bySub.id, baru: false, token: await buatSesi(t, bySub.id) };
+    }
+    const byEmail = await t.get('SELECT id, google_sub FROM akun WHERE email = ?', email);
+    if (byEmail) {
+      if (byEmail.google_sub) throw new HttpError(409, 'Email ini sudah terhubung dengan akun Google lain.');
+      // Google sudah memverifikasi pemilik email -> hubungkan ke akun email + password yang ada
+      await t.run('UPDATE akun SET google_sub = ?, foto_url = ? WHERE id = ?', p.sub, foto, byEmail.id);
+      return { id: byEmail.id, baru: false, token: await buatSesi(t, byEmail.id) };
+    }
+    const idBaru = (await t.run('INSERT INTO akun (google_sub, email, nama, foto_url) VALUES (?, ?, ?, ?)',
+      p.sub, email, nama, foto)).lastInsertRowid;
+    return { id: idBaru, baru: true, token: await buatSesi(t, idBaru) };
+  });
+  setCookieSesi(req, res, token, SESI_HARI * 86400);
+  req.akun = await db.get('SELECT * FROM akun WHERE id = ?', id);
+  req.isAdmin = isAdminEmail(email);
+  res.json({ ...(await dataAkun(req)), baru });
+}));
 
-app.get('/api/auth/me', (req, res) => res.json(req.akun ? dataAkun(req) : null));
+app.get('/api/auth/me', h(async (req, res) => res.json(req.akun ? await dataAkun(req) : null)));
 
-app.post('/api/auth/logout', (req, res) => {
+app.post('/api/auth/logout', h(async (req, res) => {
   const token = bacaCookie(req, 'bc_sesi');
-  if (token) db.prepare('DELETE FROM sesi WHERE token_hash = ?').run(hashToken(token));
+  if (token) await db.run('DELETE FROM sesi WHERE token_hash = ?', hashToken(token));
   setCookieSesi(req, res, '', 0);
   res.json({ ok: true });
-});
+}));
 
-// Lengkapi / ubah profil akun (langkah "daftar" setelah masuk pertama kali)
-app.put('/api/akun/profil', perluMasuk, (req, res) => {
-  try {
-    const d = validasiProfil(req.body || {}, { alamatWajib: false });
-    transaction(() => simpanPelangganAkun(req.akun, d));
-    res.json(dataAkun(req));
-  } catch (err) { tanganiError(res, err); }
-});
+// Lengkapi / ubah profil akun
+app.put('/api/akun/profil', perluMasuk, h(async (req, res) => {
+  const d = validasiProfil(req.body || {}, { alamatWajib: false });
+  await db.transaction((t) => simpanPelangganAkun(t, req.akun, d));
+  res.json(await dataAkun(req));
+}));
 
 // Riwayat pesanan milik akun yang sedang masuk
-app.get('/api/akun/pesanan', perluMasuk, (req, res) => {
+app.get('/api/akun/pesanan', perluMasuk, h(async (req, res) => {
   if (!req.akun.pelanggan_id) return res.json([]);
-  res.json(db.prepare(
+  res.json(await db.all(
     `SELECT kode_pesanan, status, jadwal_tanggal, jadwal_jam, lokasi, jumlah_unit, total_harga,
             paket_nama, durasi_bulan, layanan, catatan_admin, dibuat_pada
-       FROM v_pesanan_detail WHERE pelanggan_id = ? ORDER BY id DESC`
-  ).all(req.akun.pelanggan_id));
-});
+       FROM v_pesanan_detail WHERE pelanggan_id = ? ORDER BY id DESC`, req.akun.pelanggan_id));
+}));
 
 // ------------------------------------------------------------ API publik
-app.get('/api/layanan', (req, res) => {
-  res.json(db.prepare('SELECT id, kode, nama, deskripsi, ikon FROM layanan WHERE aktif = 1 ORDER BY id').all());
-});
+app.get('/api/layanan', h(async (req, res) => {
+  res.json(await db.all('SELECT id, kode, nama, deskripsi, ikon FROM layanan WHERE aktif = 1 ORDER BY id'));
+}));
 
-app.get('/api/paket', (req, res) => {
-  res.json(db.prepare('SELECT id, nama, durasi_bulan, harga, diskon_persen FROM paket WHERE aktif = 1 ORDER BY durasi_bulan').all());
-});
+app.get('/api/paket', h(async (req, res) => {
+  res.json(await db.all('SELECT id, nama, durasi_bulan, harga, diskon_persen FROM paket WHERE aktif = 1 ORDER BY durasi_bulan'));
+}));
 
 // Jam yang tersedia / sudah terisi pada tanggal tertentu
-app.get('/api/jadwal', (req, res) => {
+app.get('/api/jadwal', h(async (req, res) => {
   const { tanggal } = req.query;
   if (!tanggalValid(tanggal)) return gagal(res, 400, 'Format tanggal tidak valid.');
-  const terisi = db
-    .prepare("SELECT jadwal_jam FROM pesanan WHERE jadwal_tanggal = ? AND status <> 'dibatalkan'")
-    .all(tanggal)
+  const terisi = (await db.all("SELECT jadwal_jam FROM pesanan WHERE jadwal_tanggal = ? AND status <> 'dibatalkan'", tanggal))
     .map((r) => r.jadwal_jam);
   res.json({ tanggal, jam: JAM_LAYANAN, terisi });
-});
-
-// Pemesan tanpa akun (tamu): cari pelanggan berdasarkan No. HP atau buat baru.
-// Data profil milik akun terdaftar tidak ditimpa oleh pesanan tamu.
-function simpanPelangganTamu(d) {
-  const ada = db.prepare(
-    'SELECT p.id, a.id AS akun_id FROM pelanggan p LEFT JOIN akun a ON a.pelanggan_id = p.id WHERE p.no_hp = ?'
-  ).get(d.hp);
-  if (ada) {
-    if (!ada.akun_id) {
-      db.prepare(
-        `UPDATE pelanggan SET nama_lengkap = ?, instansi = ?, alamat = ?, diperbarui_pada = datetime('now','localtime')
-          WHERE id = ?`
-      ).run(d.nama, d.instansi, d.alamat, ada.id);
-    }
-    return ada.id;
-  }
-  return Number(db.prepare('INSERT INTO pelanggan (nama_lengkap, no_hp, instansi, alamat) VALUES (?, ?, ?, ?)')
-    .run(d.nama, d.hp, d.instansi, d.alamat).lastInsertRowid);
-}
+}));
 
 // Membuat pesanan baru. Sesuai alur wireframe, pemesan tidak wajib masuk;
 // jika sudah masuk, pesanan otomatis tercatat di akunnya.
-app.post('/api/pesanan', (req, res) => {
+app.post('/api/pesanan', h(async (req, res) => {
   const b = req.body || {};
-  try {
-    // Layanan
-    const layananIds = Array.isArray(b.layanan_ids)
-      ? [...new Set(b.layanan_ids.map(Number))].filter(Number.isInteger)
-      : [];
-    if (layananIds.length === 0) throw new HttpError(400, 'Pilih minimal satu layanan.');
-    const layanan = db
-      .prepare(`SELECT id, nama FROM layanan WHERE aktif = 1 AND id IN (${layananIds.map(() => '?').join(',')})`)
-      .all(...layananIds);
-    if (layanan.length !== layananIds.length) throw new HttpError(400, 'Layanan yang dipilih tidak valid.');
 
-    // Paket & jumlah unit
-    const paket = db.prepare('SELECT * FROM paket WHERE id = ? AND aktif = 1').get(Number(b.paket_id));
-    if (!paket) throw new HttpError(400, 'Paket tidak valid.');
-    const unit = Number(b.jumlah_unit ?? 1);
-    if (!Number.isInteger(unit) || unit < 1 || unit > 100) throw new HttpError(400, 'Jumlah unit harus 1 - 100.');
+  // Layanan
+  const layananIds = Array.isArray(b.layanan_ids)
+    ? [...new Set(b.layanan_ids.map(Number))].filter(Number.isInteger)
+    : [];
+  if (layananIds.length === 0) throw new HttpError(400, 'Pilih minimal satu layanan.');
+  const layanan = await db.all(
+    `SELECT id, nama FROM layanan WHERE aktif = 1 AND id IN (${layananIds.map(() => '?').join(',')})`, ...layananIds);
+  if (layanan.length !== layananIds.length) throw new HttpError(400, 'Layanan yang dipilih tidak valid.');
 
-    // Jadwal
-    const { tanggal, jam } = b;
-    if (!tanggalValid(tanggal)) throw new HttpError(400, 'Tanggal tidak valid.');
-    if (!JAM_LAYANAN.includes(jam)) throw new HttpError(400, 'Jam layanan tidak valid.');
-    const hariIni = ymdLokal();
-    if (tanggal < hariIni || (tanggal === hariIni && jam <= jamLokal())) {
-      throw new HttpError(400, 'Jadwal yang dipilih sudah lewat.');
-    }
+  // Paket & jumlah unit
+  const paket = await db.get('SELECT * FROM paket WHERE id = ? AND aktif = 1', Number(b.paket_id) || 0);
+  if (!paket) throw new HttpError(400, 'Paket tidak valid.');
+  const unit = Number(b.jumlah_unit ?? 1);
+  if (!Number.isInteger(unit) || unit < 1 || unit > 100) throw new HttpError(400, 'Jumlah unit harus 1 - 100.');
 
-    // Data pemesan (sekaligus memperbarui profil akun)
-    const d = validasiProfil(b, { alamatWajib: true });
-    const total = paket.harga * unit;
+  // Jadwal
+  const { tanggal, jam } = b;
+  if (!tanggalValid(tanggal)) throw new HttpError(400, 'Tanggal tidak valid.');
+  if (!JAM_LAYANAN.includes(jam)) throw new HttpError(400, 'Jam layanan tidak valid.');
+  const hariIni = ymdLokal();
+  if (tanggal < hariIni || (tanggal === hariIni && jam <= jamLokal())) {
+    throw new HttpError(400, 'Jadwal yang dipilih sudah lewat.');
+  }
 
-    const hasil = transaction(() => {
-      const pelangganId = req.akun ? simpanPelangganAkun(req.akun, d) : simpanPelangganTamu(d);
-      const kode = buatKodePesanan();
-      const pesananId = Number(
-        db.prepare(
-          `INSERT INTO pesanan (kode_pesanan, pelanggan_id, paket_id, jumlah_unit, harga_satuan, total_harga,
-                                jadwal_tanggal, jadwal_jam, lokasi)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`
-        ).run(kode, pelangganId, paket.id, unit, paket.harga, total, tanggal, jam, d.alamat).lastInsertRowid
-      );
-      const insLayanan = db.prepare('INSERT INTO pesanan_layanan (pesanan_id, layanan_id) VALUES (?, ?)');
-      for (const l of layanan) insLayanan.run(pesananId, l.id);
-      return db.prepare('SELECT * FROM v_pesanan_detail WHERE id = ?').get(pesananId);
-    });
-    res.status(201).json(hasil);
-  } catch (err) { tanganiError(res, err); }
-});
+  // Data pemesan
+  const d = validasiProfil(b, { alamatWajib: true });
+  const total = paket.harga * unit;
+
+  const pesananId = await db.transaction(async (t) => {
+    const pelangganId = req.akun ? await simpanPelangganAkun(t, req.akun, d) : await simpanPelangganTamu(t, d);
+    const id = (await t.run(
+      `INSERT INTO pesanan (kode_pesanan, pelanggan_id, paket_id, jumlah_unit, harga_satuan, total_harga,
+                            jadwal_tanggal, jadwal_jam, lokasi)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      buatKodePesanan(), pelangganId, paket.id, unit, paket.harga, total, tanggal, jam, d.alamat)).lastInsertRowid;
+    for (const l of layanan) await t.run('INSERT INTO pesanan_layanan (pesanan_id, layanan_id) VALUES (?, ?)', id, l.id);
+    return id;
+  });
+  res.status(201).json(await db.get('SELECT * FROM v_pesanan_detail WHERE id = ?', pesananId));
+}));
 
 // ------------------------------------------------------------- API admin
-app.get('/api/admin/ringkasan', perluAdmin, (req, res) => {
+app.get('/api/admin/ringkasan', perluAdmin, h(async (req, res) => {
   const perStatus = Object.fromEntries(STATUS.map((s) => [s, 0]));
-  for (const r of db.prepare('SELECT status, COUNT(*) AS n FROM pesanan GROUP BY status').all()) perStatus[r.status] = r.n;
-  const { pendapatan } = db
-    .prepare("SELECT COALESCE(SUM(total_harga), 0) AS pendapatan FROM pesanan WHERE status IN ('dikonfirmasi','diproses','selesai')")
-    .get();
-  const { pelanggan } = db.prepare('SELECT COUNT(*) AS pelanggan FROM pelanggan').get();
-  const { akun } = db.prepare('SELECT COUNT(*) AS akun FROM akun').get();
-  res.json({ per_status: perStatus, pendapatan, pelanggan, akun });
-});
+  for (const r of await db.all('SELECT status, COUNT(*) AS n FROM pesanan GROUP BY status')) perStatus[r.status] = Number(r.n);
+  const { pendapatan } = await db.get(
+    "SELECT COALESCE(SUM(total_harga), 0) AS pendapatan FROM pesanan WHERE status IN ('dikonfirmasi','diproses','selesai')");
+  const { pelanggan } = await db.get('SELECT COUNT(*) AS pelanggan FROM pelanggan');
+  const { akun } = await db.get('SELECT COUNT(*) AS akun FROM akun');
+  res.json({ per_status: perStatus, pendapatan: Number(pendapatan), pelanggan: Number(pelanggan), akun: Number(akun) });
+}));
 
-app.get('/api/admin/pesanan', perluAdmin, (req, res) => {
+app.get('/api/admin/pesanan', perluAdmin, h(async (req, res) => {
   const { status } = req.query;
-  const rows = STATUS.includes(status)
-    ? db.prepare('SELECT * FROM v_pesanan_detail WHERE status = ? ORDER BY jadwal_tanggal, jadwal_jam').all(status)
-    : db.prepare('SELECT * FROM v_pesanan_detail ORDER BY id DESC').all();
-  res.json(rows);
-});
+  res.json(STATUS.includes(status)
+    ? await db.all('SELECT * FROM v_pesanan_detail WHERE status = ? ORDER BY jadwal_tanggal, jadwal_jam', status)
+    : await db.all('SELECT * FROM v_pesanan_detail ORDER BY id DESC'));
+}));
 
-app.patch('/api/admin/pesanan/:id', perluAdmin, (req, res) => {
+app.patch('/api/admin/pesanan/:id', perluAdmin, h(async (req, res) => {
   const id = Number(req.params.id);
   const { status } = req.body || {};
+  if (!Number.isInteger(id)) return gagal(res, 404, 'Pesanan tidak ditemukan.');
   if (!STATUS.includes(status)) return gagal(res, 400, 'Status tidak valid.');
   const catatan = teks(req.body.catatan_admin, 500) || null;
   try {
-    const r = db
-      .prepare("UPDATE pesanan SET status = ?, catatan_admin = ?, diperbarui_pada = datetime('now','localtime') WHERE id = ?")
-      .run(status, catatan, id);
+    const r = await db.run(`UPDATE pesanan SET status = ?, catatan_admin = ?, diperbarui_pada = ${SEKARANG} WHERE id = ?`,
+      status, catatan, id);
     if (r.changes === 0) return gagal(res, 404, 'Pesanan tidak ditemukan.');
-    res.json(db.prepare('SELECT * FROM v_pesanan_detail WHERE id = ?').get(id));
   } catch (err) {
     if (String(err.message).includes('jadwal_tanggal')) {
       return gagal(res, 409, 'Slot jadwal pesanan ini sudah dipakai pesanan lain, tidak bisa diaktifkan kembali.');
     }
-    tanganiError(res, err);
+    throw err;
   }
-});
+  res.json(await db.get('SELECT * FROM v_pesanan_detail WHERE id = ?', id));
+}));
 
 // JSON rusak / error lain
 app.use((err, req, res, next) => {
   if (err.type === 'entity.parse.failed') return gagal(res, 400, 'Format data tidak valid.');
-  console.error(err);
-  gagal(res, 500, 'Terjadi kesalahan pada server.');
+  tanganiError(res, err);
 });
 
-app.listen(PORT, () => {
-  console.log(`BoysClub IT berjalan di http://localhost:${PORT}`);
-  console.log(`Login: email + password${GOOGLE_CLIENT_ID ? ' & Google' : ' (tombol Google nonaktif, GOOGLE_CLIENT_ID kosong)'}`);
-  console.log(ADMIN_EMAILS.length
-    ? `Admin: ${ADMIN_EMAILS.join(', ')}`
-    : '[!] ADMIN_EMAILS belum diisi di file .env - belum ada akun admin.');
-  if (ADMIN_EMAILS.length && !ADMIN_KODE) {
-    console.log('[!] ADMIN_KODE belum diisi di file .env - admin belum bisa mendaftar dengan email + password.');
-  }
-});
+module.exports = app;
+
+// Dijalankan langsung (`npm start` / Jalankan Aplikasi.bat) -> nyalakan server lokal
+if (require.main === module) {
+  init().then(() => {
+    app.listen(PORT, () => {
+      console.log(`BoysClub IT berjalan di http://localhost:${PORT}`);
+      console.log(`Database: ${db.jenis}`);
+      console.log(`Login: email + password${GOOGLE_CLIENT_ID ? ' & Google' : ' (tombol Google nonaktif, GOOGLE_CLIENT_ID kosong)'}`);
+      console.log(ADMIN_EMAILS.length
+        ? `Admin: ${ADMIN_EMAILS.join(', ')}`
+        : '[!] ADMIN_EMAILS belum diisi di file .env - belum ada akun admin.');
+      if (ADMIN_EMAILS.length && !ADMIN_KODE) {
+        console.log('[!] ADMIN_KODE belum diisi di file .env - admin belum bisa mendaftar dengan email + password.');
+      }
+    });
+  }).catch((err) => {
+    console.error('Gagal menyiapkan database:', err.message);
+    process.exit(1);
+  });
+}

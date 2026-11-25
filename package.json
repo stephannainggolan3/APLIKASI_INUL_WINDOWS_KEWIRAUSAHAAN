@@ -12,7 +12,9 @@
     "node": ">=22.13"
   },
   "dependencies": {
+    "@libsql/client": "^0.18.0",
     "express": "^4.21.2",
-    "google-auth-library": "^11.3.4"
+    "google-auth-library": "^11.3.4",
+    "serverless-http": "^4.0.0"
   }
 }
